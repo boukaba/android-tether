@@ -30,42 +30,110 @@ pub struct DnscryptCert {
 }
 
 fn fetch_cert(addr: SocketAddr, provider_name: &str) -> Result<DnscryptCert, String> {
-    let cert_magic: [u8; 8] = [0x72, 0x36, 0x66, 0x6e, 0x76, 0x57, 0x6a, 0x38];
-    let n = provider_name.as_bytes().len();
-    let pad = ((n + 63) / 64) * 64;
-    let mut query = vec![0u8; 8 + pad + 32];
-    query[..8].copy_from_slice(&cert_magic);
-    query[8..8 + n].copy_from_slice(provider_name.as_bytes());
+    // Build DNS TXT query
+    let mut query = vec![
+        0x00, 0x00, // ID
+        0x01, 0x00, // flags: RD
+        0x00, 0x01, // QDCOUNT
+        0x00, 0x00, // ANCOUNT
+        0x00, 0x00, // NSCOUNT
+        0x00, 0x00, // ARCOUNT
+    ];
+    for label in provider_name.split('.') {
+        if label.is_empty() { continue; }
+        query.push(label.len() as u8);
+        query.extend_from_slice(label.as_bytes());
+    }
+    query.push(0x00); // terminating zero
+    query.extend_from_slice(&[0x00, 0x10]); // TXT
+    query.extend_from_slice(&[0x00, 0x01]); // IN
 
-    let sock = UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("udp bind: {e}"))?;
-    sock.set_read_timeout(Some(CERT_FETCH_TIMEOUT))
-        .map_err(|e| format!("set_read_to: {e}"))?;
-    sock.send_to(&query, addr)
-        .map_err(|e| format!("send cert probe: {e}"))?;
+    // Try ports that bypass phone DNS interception
+    for port in &[443u16, 5353, 8443] {
+        let mut sock_addr = addr;
+        sock_addr.set_port(*port);
 
-    let mut buf = [0u8; 1024];
-    let n = sock.recv(&mut buf).map_err(|e| format!("recv cert: {e}"))?;
-    parse_cert(&buf[..n])
+        let sock = UdpSocket::bind("0.0.0.0:0")
+            .map_err(|e| format!("udp bind: {e}"))?;
+        sock.set_read_timeout(Some(CERT_FETCH_TIMEOUT))
+            .map_err(|e| format!("set_read_to: {e}"))?;
+        sock.send_to(&query, sock_addr)
+            .map_err(|e| format!("send cert query: {e}"))?;
+
+        let mut buf = [0u8; 2048];
+        let n = match sock.recv(&mut buf) {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+
+        if let Some(cert) = extract_cert_from_dns(&buf[..n]) {
+            // Cert binary is 124+ bytes, starts with DNSC
+            if cert.len() >= 124 && &cert[..4] == b"DNSC" {
+                let client_magic: [u8; 8] = cert[104..112].try_into().unwrap();
+                let server_pk: [u8; 32] = cert[72..104].try_into().unwrap();
+                let serial = u32::from_be_bytes(cert[56..60].try_into().unwrap());
+                debug!("DNSCrypt cert serial={serial}");
+                return Ok(DnscryptCert { server_pk, client_magic, serial, valid_until: 0 });
+            }
+        }
+    }
+    Err("cert fetch: no response".into())
 }
 
-fn parse_cert(data: &[u8]) -> Result<DnscryptCert, String> {
-    if data.len() < 124 || &data[..4] != b"DNSC" {
-        return Err("bad cert".into());
+/// Extract the certificate binary from a DNS TXT response.
+/// Returns the raw cert bytes (from the TXT record's first string).
+fn extract_cert_from_dns(dns_response: &[u8]) -> Option<Vec<u8>> {
+    if dns_response.len() < 12 { return None; }
+    let mut pos = 12usize;
+    // Skip question section
+    let qdcount = u16::from_be_bytes([dns_response[4], dns_response[5]]) as usize;
+    for _ in 0..qdcount {
+        while pos < dns_response.len() && dns_response[pos] != 0 {
+            let len = dns_response[pos] as usize;
+            if pos + 1 + len > dns_response.len() { return None; }
+            pos += 1 + len;
+        }
+        pos += 1; // zero byte
+        pos += 4; // QTYPE + QCLASS
     }
-    if u16::from_be_bytes([data[4], data[5]]) != 2 {
-        return Err("unsupported version".into());
+    // Answer section
+    let ancount = u16::from_be_bytes([dns_response[6], dns_response[7]]) as usize;
+    for _ in 0..ancount {
+        if pos + 10 > dns_response.len() { break; }
+        // Handle name (may be compressed pointer)
+        if dns_response[pos] & 0xC0 == 0xC0 {
+            pos += 2;
+        } else {
+            while pos < dns_response.len() && dns_response[pos] != 0 {
+                let len = dns_response[pos] as usize;
+                if pos + 1 + len > dns_response.len() { return None; }
+                pos += 1 + len;
+            }
+            pos += 1;
+        }
+        let rtype = u16::from_be_bytes([dns_response[pos], dns_response[pos+1]]);
+        pos += 8; // type + class + ttl
+        let rdlen = u16::from_be_bytes([dns_response[pos], dns_response[pos+1]]) as usize;
+        pos += 2;
+        if pos + rdlen > dns_response.len() { break; }
+        if rtype == 16 {
+            // TXT record: length-prefixed strings
+            let txt_data = &dns_response[pos..pos + rdlen];
+            // Concatenate all length-prefixed strings
+            let mut cert = Vec::new();
+            let mut tp = 0usize;
+            while tp < txt_data.len() {
+                let slen = txt_data[tp] as usize;
+                tp += 1;
+                if tp + slen > txt_data.len() { break; }
+                cert.extend_from_slice(&txt_data[tp..tp + slen]);
+                tp += slen;
+            }
+            if !cert.is_empty() { return Some(cert); }
+        }
+        pos += rdlen;
     }
-    let payload = &data[6..data.len() - 64];
-    if payload.len() < 84 {
-        return Err("truncated cert".into());
-    }
-    let client_magic: [u8; 8] = payload[32..40].try_into().unwrap();
-    let serial = u32::from_be_bytes(payload[40..44].try_into().unwrap());
-    let valid_until = u32::from_be_bytes(payload[48..52].try_into().unwrap());
-    let server_pk: [u8; 32] = payload[52..84].try_into().unwrap();
-
-    debug!("DNSCrypt cert serial={serial}");
-    Ok(DnscryptCert { server_pk, client_magic, serial, valid_until })
+    None
 }
 
 // ── Session ──
@@ -102,7 +170,7 @@ impl DnscryptSession {
     pub fn encrypt(&self, query: &[u8]) -> Result<Vec<u8>, String> {
         let nonce_vec = dryoc::rng::randombytes_buf(CRYPTO_SECRETBOX_NONCEBYTES / 2);
         let mut nonce = [0u8; CRYPTO_SECRETBOX_NONCEBYTES];
-        nonce[12..].copy_from_slice(&nonce_vec);
+        nonce[..12].copy_from_slice(&nonce_vec); // random first 12, zeros last 12
 
         let mut ciphertext = vec![0u8; CRYPTO_SECRETBOX_MACBYTES + query.len()];
         crypto_secretbox_easy(&mut ciphertext, query, &nonce, &self.shared_key)
@@ -127,7 +195,7 @@ impl DnscryptSession {
         let encrypted = &data[20..];
 
         let mut nonce = [0u8; CRYPTO_SECRETBOX_NONCEBYTES];
-        nonce[12..].copy_from_slice(nonce_vec);
+        nonce[..12].copy_from_slice(nonce_vec); // random first 12, zeros last 12
 
         let mut plaintext = vec![0u8; encrypted.len() - CRYPTO_SECRETBOX_MACBYTES];
         crypto_secretbox_open_easy(&mut plaintext, encrypted, &nonce, &self.shared_key)
@@ -139,28 +207,17 @@ impl DnscryptSession {
 // ── Providers ──
 
 struct DnscryptProvider {
-    known_pk: Option<[u8; 32]>,
     addr: SocketAddr,
     provider_name: &'static str,
-    client_magic: [u8; 8],
 }
 
 fn get_provider(provider: DnsProvider) -> DnscryptProvider {
     match provider {
         DnsProvider::Cloudflare | DnsProvider::Google | DnsProvider::Quad9 => {
-            // Cisco OpenDNS — actually works on UDP 443 through phone tethering
+            // Cisco OpenDNS — works through phone USB tethering
             DnscryptProvider {
-                // Known public key for Cisco OpenDNS (from dnscrypt.info stamp list)
-                known_pk: Some([
-                    0xb7, 0x35, 0x11, 0x40, 0x20, 0x6f, 0x22, 0x5d,
-                    0x3e, 0x2b, 0xd8, 0x22, 0xd7, 0xfd, 0x69, 0x1e,
-                    0xa1, 0xc3, 0x3c, 0xc8, 0xd6, 0x66, 0x8d, 0x0c,
-                    0xbe, 0x04, 0xbf, 0xab, 0xca, 0x43, 0xfb, 0x79,
-                ]),
                 addr: "208.67.220.220:443".parse().unwrap(),
                 provider_name: "2.dnscrypt-cert.opendns.com",
-                // Cisco short cert uses all-zeros client magic
-                client_magic: [0u8; 8],
             }
         }
     }
@@ -180,22 +237,9 @@ pub struct DnscryptPool {
 
 pub fn create_dnscrypt_pool(provider: DnsProvider) -> Result<SharedDnscryptPool, String> {
     let prov = get_provider(provider);
-
-    let cert = if let Some(pk) = prov.known_pk {
-        // Use hardcoded public key (short cert format — Cisco, etc.)
-        info!("DNSCrypt using known key for {} ({})", prov.provider_name, prov.addr);
-        DnscryptCert {
-            server_pk: pk,
-            client_magic: prov.client_magic,
-            serial: 0,
-            valid_until: 0,
-        }
-    } else {
-        fetch_cert(prov.addr, prov.provider_name)
-            .map_err(|e| format!("DNSCrypt cert fetch: {e}"))?
-    };
+    let cert = fetch_cert(prov.addr, prov.provider_name)
+        .map_err(|e| format!("DNSCrypt cert fetch: {e}"))?;
     info!("DNSCrypt cert ready (serial={})", cert.serial);
-
     Ok(Arc::new(Mutex::new(DnscryptPool {
         cert,
         session: None,
