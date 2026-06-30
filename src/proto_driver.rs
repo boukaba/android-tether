@@ -1,6 +1,6 @@
 use crate::usb_device::UsbDevice;
 
-pub trait ProtocolDriver: Send {
+pub trait ProtocolDriver: Send + Sync {
     fn name(&self) -> &str;
 
     fn init(&mut self, usb: &UsbDevice) -> crate::error::Result<()>;
@@ -15,6 +15,7 @@ pub trait ProtocolDriver: Send {
         on_frame: &mut dyn FnMut(&[u8]),
     ) -> crate::error::Result<()>;
 
+    #[allow(dead_code)]
     fn keepalive(&mut self, usb: &UsbDevice) -> crate::error::Result<()> {
         let _ = usb;
         Ok(())

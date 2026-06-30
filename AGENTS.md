@@ -18,27 +18,33 @@ echo "061828" | sudo -S ./target/release/android-tether --verbose
 - `--gateway / --netmask` — Override defaults when using `--static`
 
 ## Current Status (June 2026)
-- **DHCP**: Fully working. Discovers IP, gateway, netmask, DNS.
+- **Migration to nusb**: Complete. `rusb` (libusb C dep) replaced with `nusb` v0.2.4 (pure Rust via macOS IOKit).
+- **USB I/O engine**: New async multi-URB engine (`usb_io.rs`) — 8 concurrent RX buffers, event loop with 1ms polling, TX channel drain, frame processing in dedicated I/O thread. No mutex contention.
+- **DHCP**: Uses synchronous `recv_bulk`/`send_bulk` on `UsbDevice` (temp endpoints) before I/O thread starts. RNDIS indications properly skipped during iteration.
 - **RNDIS init**: Complete. INIT→QUERY(mac)→SET(packet filter) via control endpoint.
-- **USB I/O**: Control + bulk (IN/OUT). Interrupt endpoint NOT read.
 - **utun**: Created, configured with `ifconfig`, registered via `scutil`.
 - **Routing**: `0.0.0.0/1` + `128.0.0.0/1` split routes via gateway. Stale route cleanup.
-- **RX path**: Bulk IN → RNDIS unwrap → `eth_to_utun()` → utun write.
-- **TX path**: utun poll → `ip_to_eth()` → RNDIS wrap → push to shared TX queue. RX thread drains queue → `send_bulk`.
-- **Bridge data flows (WORKING!)**: TX~130+ pkts, RX~120+ pkts during curl/ping. Ping to gateway (13ms), ping to 8.8.8.8 (~250ms), curl HTTP 200 — **all working!**
+- **RX path**: 8 concurrent URBs (multi-URB) → RNDIS unwrap → `eth_to_utun()` → utun write.
+- **TX path**: utun poll → `ip_to_eth()` → RNDIS wrap → push to bounded mpsc channel. I/O thread drains channel and submits OUT transfers.
+- **Bridge data flows (WORKING!)**: DHCP discovery works, multi-URB RX path delivers frames, TX path sends packets. Ping to gateway (1-2ms), internet reachable.
+- **Auto-reconnect on USB disconnect**: I/O thread detects disconnection via 50 consecutive USB errors or 10s idle with zero pending URBs. Signals `device_gone` + stops bridge → watch loop waits 3s → retries `run_session()`. Works with `--watch` mode.
+- **Debug memory auto-clear**: Periodic `stderr.flush()` every loop iteration (~100ms) prevents buffered log accumulation. Stats logging reduced to every 5s (was 1s). Per-frame debug capped at 10 lines.
 
 ## Architecture
 ```
-                      ┌──────────────────────────────────────┐
-                      │             RX Thread                │
-[Android] ──USB──▶   │ recv_bulk → unwrap → eth_to_utun     │ ──utun write──▶ [macOS kernel]
-           ◀──USB──   │ drain tx_queue → send_bulk           │
-                      └──────┬───────────────────────────────┘
-                             │ tx_queue (shared mutex)
-                      ┌──────┴───────────────────────────────┐
-                      │             TX Thread                │
-[macOS kernel] ──utun FD──▶ poll/read → ip_to_eth → wrap → push to queue
-                      └──────────────────────────────────────┘
+                      ┌──────────────────────────────────────────┐
+                      │           I/O Thread (UsbIo)             │
+                      │  8 concurrent RX URB submissions          │
+[Android] ──USB──▶   │  event loop: wait_next_complete(1ms)      │ ──utun write──▶ [macOS kernel]
+           ◀──USB──   │  → RNDIS unwrap → eth_to_utun             │
+                      │  → ARP handling → gateway MAC learning    │
+                      │  drain tx_receiver → send_bulk (OUT)     │
+                      └───────────────┬──────────────────────────┘
+                                      │ mpsc::sync_channel<Vec<u8>>(256)
+                               ┌──────┴──────────────────────────┐
+                               │         TX Thread               │
+[macOS kernel] ──utun FD──▶    │ poll/read → ip_to_eth → wrap → push
+                               └─────────────────────────────────┘
 ```
 
 ## Key Design Decisions
@@ -47,11 +53,13 @@ echo "061828" | sudo -S ./target/release/android-tether --verbose
 - `#[repr(C, packed)]` on ARM64 macOS can misalign 32-bit fields when 6-byte MAC fields precede them.
 - Solution: `read_u32(buf, offset)` / `write_u32(buf, offset, val)` using explicit little-endian byte reads.
 
-### Single-threaded USB access
-- `Arc<Mutex<UsbDevice>>` is shared between main and RX threads (ARP keepalive + RX data path).
-- TX thread never touches USB directly — pushes RNDIS-wrapped packets to `Arc<Mutex<Vec<Vec<u8>>>>` queue.
-- RX thread drains queue and sends via `send_bulk` between `recv_bulk` calls.
-- Eliminates lock contention that previously caused TX thread to block permanently on `usb.lock()`.
+### Multi-URB I/O with nusb
+- Replaced `rusb` (C libusb binding) with `nusb` v0.2.4 (pure Rust, uses IOKit on macOS).
+- `UsbIo` struct owns permanent `Endpoint<Bulk, In>` and `Endpoint<Bulk, Out>`.
+- 8 RX buffers submitted upfront, resubmitted after each completion (including error/timeout).
+- Event loop: `wait_next_complete(1ms)` for RX completions → process frames → drain TX completions → drain TX channel → loop.
+- Single thread owns all USB endpoints — zero mutex contention.
+- Before I/O thread starts, DHCP uses `UsbDevice::send_bulk/recv_bulk` which create temp endpoints per-call.
 
 ### Host MAC = device_mac (C code compatible)
 - Unlike Ethernet bridging, RNDIS is a point-to-point link. The phone accepts frames with src=device_mac.
@@ -110,9 +118,27 @@ echo "061828" | sudo -S ./target/release/android-tether --verbose
 - **Fix**: Log error and continue. `Err(e) => debug!("TX USB send failed: {e}")`.
 - **Source**: `src/main.rs`, TX thread
 
-### 7. `continue` inside lock scope prevented lock release
+### 8. `ep_out.wait_next_complete(Duration::ZERO)` without pending check (KILLED BRIDGE)
+- **Root cause**: nusb panics when `wait_next_complete(ZERO)` is called if `pending() == 0`. The TX completion drain loop ran unconditionally.
+- **Fix**: Guard with `while self.ep_out.pending() > 0` before calling `wait_next_complete`.
+- **Consequence**: Bridge panicked immediately on startup if no TX transfers were pending.
+- **Source**: `src/usb_io.rs`
+
+### 9. RndisPacketIter stopped at non-data RNDIS messages (KILLED DHCP)
+- **Root cause**: `RndisPacketIter::next()` returned `None` when encountering any non-data RNDIS message (indications, etc.), stopping iteration prematurely. Phone floods 860-byte indication messages at connection, so DHCP OFFER was never reached.
+- **Fix**: Changed `next()` to skip non-data messages with `continue` instead of returning `None`. Added robust distinction: data packets have `DataOffset >= 36` and `DataLength > 0`. Indications share type `0x00000001` but have `Status` (not `DataOffset`) at offset 8.
+- **Consequence**: DHCP always fell back to static IP.
+- **Source**: `src/rndis.rs`
+
+### 7. `continue` inside lock scope prevented lock release (retained numbering)
 - **Root cause**: `{ let usb_lock = usb_rx.lock().unwrap(); match { Ok(0) => continue, ... } }` — the `continue` was INSIDE the block where `usb_lock` was defined. Compiler may not drop the lock before the loop jump.
 - **Fix**: Restructure so lock guard scope is fully closed before `continue`. Use `match n {}` after the block.
+
+### 10. Infinite resubmit loop on USB disconnect (KILLED ALL DISCONNECT/RECONNECT + CTRL-C)
+- **Root cause**: `process_rx_completion()` resubmitted URBs on every completion, even USB errors (`comp.status.is_err()`). On disconnect, nusb's `Endpoint::submit()` on a dead endpoint immediately completes the buffer with an error or drops it and the error is returned instantly by nusb. This created an infinite `while let Some(extra)` drain loop — each error completion triggered another `submit()`, which immediately returned another completion, ad infinitum. The IO thread never exited, so `running_bridge` was never set to false, and the global `running` (Ctrl-C) flag was never checked.
+- **Fix**: `process_rx_completion()` now returns immediately on `comp.status.is_err()` WITHOUT resubmitting the buffer. This causes `ep_in.pending()` to drop by 1. When all NUM_RX_BUFS (8) URBs are consumed, `pending() == 0` triggers immediate disconnect detection via `device_gone` + `running.store(false)`.
+- **Consequence**: On cable disconnect: infinite nusb ERROR log spam, no reconnect, Ctrl-C was completely unresponsive — process had to be SIGKILL'd.
+- **Source**: `src/usb_io.rs`, `process_rx_completion()`
 
 ---
 
@@ -126,6 +152,9 @@ The phone's RNDIS driver does not accept unicast Ethernet frames from a host MAC
 
 ### DO NOT share USB between TX and RX threads
 Synchronous `rusb` read_bulk/write_bulk with `Arc<Mutex>` creates lock contention. Use a TX queue: TX thread prepares RNDIS-wrapped packets, RX thread sends them.
+
+### DO NOT use `Arc<Mutex<Vec<Vec<u8>>>>` for the TX queue
+It provides no backpressure — the TX thread fills the queue infinitely when USB is slow, causing unbounded memory growth. Use `mpsc::sync_channel(256)` instead: `send()` blocks the TX thread when the channel is full, which stalls utun reads and lets the kernel pace application output.
 
 ### DO NOT put `continue` or `break` inside a scope that holds a mutex lock
 Always ensure the lock guard (`MutexGuard`) is dropped before the control flow jump. Pattern: `{ let lock = ...; /* work */ } match result { ... continue }`.
@@ -160,14 +189,31 @@ Minimum Ethernet frame = 60 bytes (without FCS), but RNDIS does NOT require padd
 ### DO NOT read the interrupt endpoint unless necessary
 The C code does NOT read the interrupt endpoint. Reading it creates unnecessary lock contention. Only implement if a specific phone requires it.
 
+### DO NOT call `wait_next_complete(Duration::ZERO)` when `pending() == 0`
+nusb panics with "no transfer pending" when `wait_next_complete` is called with zero duration and no transfers are pending. Always guard with `ep.pending() > 0`.
+
+### DO NOT return `None` from `RndisPacketIter::next()` on non-data messages
+RNDIS data stream can contain interleaved control messages (indications, etc.). The iterator must `continue` to skip them, not `return None`, or the caller misses subsequent data packets (like DHCP responses buried after indication messages).
+
+### DO NOT assume RNDIS_MSG_PACKET and RNDIS_MSG_INDICATE have different type codes
+Both are `0x00000001`. Distinguish them by structure: data packets have `DataOffset >= 36` (the header size) and `DataLength > 0`, while indications have `Status` (a status code, not offset) at byte offset 8.
+
+### DO NOT resubmit URBs on USB error from `process_rx_completion`
+When nusb's `Endpoint::submit()` is called on a dead endpoint (device disconnected), the buffer immediately completes with error or is returned instantly, creating an unbounded `while let Some(extra)` cycle. Instead: drop the error completion (don't resubmit), let `pending()` decay to 0, and detect disconnection when all URBs are consumed.
+
+### DO NOT forget to set `running_bridge=false` when IO thread detects disconnect
+The IO thread must set both `device_gone` AND `running` (bridge flag) before breaking. Otherwise the main loop spins forever waiting for bridge to stop. The `tx_receiver` drop from IO thread exit unblocks the TX thread.
+
+### DO NOT store log output without periodic flush
+`env_logger` buffers stderr output when piped. Call `std::io::stderr().flush()` regularly to prevent unbounded memory accumulation of buffered log data.
+
 ---
 
 ## Next Steps / Open Issues
-1. **Async/multi-urb I/O** — Original C code uses 16 async RX URBs and 64 async TX URBs for throughput. Current Rust uses synchronous blocking. This limits performance.
-2. **`--version` flag** — Not yet implemented.
-3. **Manpage** — Not yet generated.
-4. **.app bundle packaging** — Consider `macos/` build script like the original project.
-5. **Port to Windows/Linux** — The `ProtocolDriver` trait makes it easy to add ECM/NCM drivers.
+1. **`--version` flag** — Not yet implemented.
+2. **Manpage** — Not yet generated.
+3. **.app bundle packaging** — Consider `macos/` build script like the original project.
+4. **Port to Windows/Linux** — The `ProtocolDriver` trait makes it easy to add ECM/NCM drivers.
 
 ## Sudo Password
 `061828` — needed for `ifconfig`, `route`, `scutil`.
@@ -179,7 +225,8 @@ The C code does NOT read the interrupt endpoint. Reading it creates unnecessary 
 | `src/dhcp.rs` | DHCP discover/request/ACK, option parsing |
 | `src/rndis.rs` | RNDIS message builders, parsers, packet iterator |
 | `src/frame.rs` | `ip_to_eth()` / `eth_to_utun()` frame conversion |
-| `src/usb_device.rs` | libusb device discovery, ctrl/bulk I/O |
+| `src/usb_device.rs` | nusb device discovery, ctrl/bulk I/O, take_endpoints |
+| `src/usb_io.rs` | Async multi-URB I/O engine (8 RX buffers, event loop, TX drain) |
 | `src/utun.rs` | utun create, ifconfig, scutil, route setup |
 | `src/proto_rndis.rs` | RNDIS driver: init, wrap, unwrap |
 | `src/proto_driver.rs` | ProtocolDriver trait (extensible for ECM/NCM) |

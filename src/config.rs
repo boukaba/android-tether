@@ -4,6 +4,20 @@ use log::LevelFilter;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DnsMode {
+    System,
+    DoH,
+    DoT,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DnsProvider {
+    Cloudflare,
+    Google,
+    Quad9,
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "android-tether", version, about = "Android USB Tethering for macOS (Rust)")]
 pub struct CliArgs {
@@ -30,6 +44,21 @@ pub struct CliArgs {
 
     #[arg(short = 'w', long = "watch")]
     pub watch: bool,
+
+    #[arg(long = "dns-mode", value_name = "MODE", default_value = "system")]
+    pub dns_mode: String,
+
+    #[arg(long = "dns-provider", value_name = "PROVIDER", default_value = "cloudflare")]
+    pub dns_provider: String,
+
+    #[arg(long = "daemon", help = "Run in background mode (for use by launchd)")]
+    pub daemon: bool,
+
+    #[arg(long = "install", help = "Install as a launchd daemon (auto-start on device plug)")]
+    pub install: bool,
+
+    #[arg(long = "uninstall", help = "Remove the launchd daemon")]
+    pub uninstall: bool,
 }
 
 #[derive(Debug)]
@@ -41,6 +70,11 @@ pub struct TetherConfig {
     pub netmask: Ipv4Addr,
     pub log_level: LevelFilter,
     pub watch_mode: bool,
+    pub dns_mode: DnsMode,
+    pub dns_provider: DnsProvider,
+    pub daemon: bool,
+    pub install: bool,
+    pub uninstall: bool,
 }
 
 impl Default for TetherConfig {
@@ -53,6 +87,11 @@ impl Default for TetherConfig {
             netmask: "255.255.255.0".parse().unwrap(),
             log_level: LevelFilter::Info,
             watch_mode: false,
+            dns_mode: DnsMode::System,
+            dns_provider: DnsProvider::Cloudflare,
+            daemon: false,
+            install: false,
+            uninstall: false,
         }
     }
 }
@@ -70,9 +109,18 @@ impl TetherConfig {
         let mut self_ = Self {
             log_level,
             watch_mode: args.watch,
+            daemon: args.daemon,
+            install: args.install,
+            uninstall: args.uninstall,
             ..Default::default()
         };
 
+        // In daemon mode, --no-route is the default (don't hijack default route)
+        if args.daemon && !args.no_route {
+            // only override if user didn't explicitly pass --no-route
+            // We don't force no_route here; the daemon plist passes --no-route by default
+            // Users can edit the plist to add routes if they want
+        }
         if args.no_route {
             self_.no_route = true;
         }
@@ -110,6 +158,9 @@ impl TetherConfig {
                 .parse()
                 .map_err(|_| TetherError::Config(format!("invalid netmask: {mask}")))?;
         }
+
+        self_.dns_mode = parse_dns_mode(&args.dns_mode);
+        self_.dns_provider = parse_dns_provider(&args.dns_provider);
 
         if self_.static_ip.is_some() && self_.gateway.is_none() {
             self_.gateway = Some("192.168.42.129".parse().unwrap());
@@ -159,9 +210,31 @@ impl TetherConfig {
                             _ => LevelFilter::Info,
                         };
                     }
+                    ("dns", "mode") => {
+                        self.dns_mode = parse_dns_mode(val);
+                    }
+                    ("dns", "provider") => {
+                        self.dns_provider = parse_dns_provider(val);
+                    }
                     _ => {}
                 }
             }
         }
+    }
+}
+
+fn parse_dns_mode(s: &str) -> DnsMode {
+    match s.to_lowercase().as_str() {
+        "doh" => DnsMode::DoH,
+        "dot" => DnsMode::DoT,
+        _ => DnsMode::System,
+    }
+}
+
+fn parse_dns_provider(s: &str) -> DnsProvider {
+    match s.to_lowercase().as_str() {
+        "google" => DnsProvider::Google,
+        "quad9" => DnsProvider::Quad9,
+        _ => DnsProvider::Cloudflare,
     }
 }

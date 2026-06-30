@@ -1,6 +1,8 @@
 mod arp;
 mod config;
+mod daemon;
 mod dhcp;
+mod dns_proxy;
 mod error;
 mod frame;
 mod ipc;
@@ -10,22 +12,38 @@ mod proto_rndis;
 mod rndis;
 mod stats;
 mod usb_device;
+mod usb_io;
 mod utun;
 
-use crate::config::TetherConfig;
+use crate::config::{DnsMode, DnsProvider, TetherConfig};
 use crate::dhcp::discover;
-use crate::frame::{eth_to_utun, ip_to_eth};
+use crate::frame::ip_to_eth;
 use crate::ipc::{IpcCommand, IpcServer};
 use crate::net_types::{MacAddr, ETH_BUF_SIZE, RNDIS_BUF_SIZE};
 use crate::proto_driver::ProtocolDriver;
 use crate::proto_rndis::RndisDriver;
 use crate::stats::SharedStats;
 use crate::usb_device::UsbDevice;
+use crate::usb_io::UsbIo;
 use crate::utun::Utun;
 use log::{debug, error, info, warn};
+use std::io::Write;
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+
+static GLOBAL_RUNNING: AtomicBool = AtomicBool::new(true);
+
+extern "C" fn sigterm_handler(_sig: i32) {
+    GLOBAL_RUNNING.store(false, Ordering::SeqCst);
+}
+
+fn is_running(running: &AtomicBool) -> bool {
+    running.load(Ordering::Relaxed) && GLOBAL_RUNNING.load(Ordering::Relaxed)
+}
+
+// (fn set_dns, etc. remain below)
 use std::time::Duration;
 
 fn scutil_run(script: &str) {
@@ -56,6 +74,110 @@ fn set_dns(dns1: Ipv4Addr, dns2: Ipv4Addr) {
     info!("DNS configured: {dns1}, {dns2}");
 }
 
+fn process_dot_serial(
+    first_pkt: Vec<u8>,
+    first_query: Vec<u8>,
+    receiver: &mpsc::Receiver<(Vec<u8>, Vec<u8>)>,
+    dot_conns: &mut Vec<crate::dns_proxy::DotPooledConn>,
+    tun: &Arc<Utun>,
+    warm: &Arc<AtomicBool>,
+    provider: DnsProvider,
+    running: &Arc<AtomicBool>,
+) {
+    const MAX_POOL: usize = 4;
+
+    let mut queries = vec![(first_pkt, first_query)];
+    while let Ok(item) = receiver.try_recv() {
+        queries.push(item);
+    }
+
+    // Expand pool if needed (up to MAX_POOL, up to batch size)
+    while dot_conns.len() < MAX_POOL.min(queries.len()) {
+        match crate::dns_proxy::create_dot_conn(provider) {
+            Ok(conn) => dot_conns.push(conn),
+            Err(e) => {
+                warn!("DoT pool expand failed: {e}");
+                break;
+            }
+        }
+    }
+
+    // Drop stale connections (servers idle-timeout ~60s, refresh at 45s)
+    // Connections carry their own creation time, stale ones will fail quickly
+    // and get reconnected by workers. No need to pre-check.
+
+    let num_workers = dot_conns.len().max(1);
+    debug!("DNS resolver: DoT pool of {num_workers} conns for {} queries", queries.len());
+
+    let (return_tx, return_rx) = mpsc::channel();
+    let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let queries = Arc::new(queries);
+
+    let mut handles = Vec::new();
+    for _ in 0..num_workers {
+        let conn = if let Some(c) = dot_conns.pop() {
+            c
+        } else {
+            match crate::dns_proxy::create_dot_conn(provider) {
+                Ok(c) => c,
+                Err(e) => { warn!("DoT worker conn failed: {e}"); continue; }
+            }
+        };
+        let tun = tun.clone();
+        let warm = warm.clone();
+        let running = running.clone();
+        let return_tx = return_tx.clone();
+        let counter = counter.clone();
+        let queries = queries.clone();
+
+        handles.push(std::thread::spawn(move || {
+            let mut conn = conn;
+            loop {
+                let i = counter.fetch_add(1, Ordering::SeqCst);
+                if i >= queries.len() || !running.load(Ordering::SeqCst) {
+                    let _ = return_tx.send(conn);
+                    break;
+                }
+                let (ref orig_pkt, ref dns_query) = queries[i];
+                let resp = match crate::dns_proxy::dot_query_pooled(&mut conn, dns_query) {
+                    Ok(r) => Some(r),
+                    Err(e) => {
+                        debug!("DoT worker: {e}, reconnecting...");
+                        match crate::dns_proxy::create_dot_conn(provider) {
+                            Ok(new_conn) => {
+                                conn = new_conn;
+                                info!("DoT worker reconnected");
+                                crate::dns_proxy::dot_query_pooled(&mut conn, dns_query).ok()
+                            }
+                            Err(e2) => { warn!("DoT reconnect failed: {e2}"); None }
+                        }
+                    }
+                };
+                if let Some(dns_resp) = resp {
+                    if !warm.load(Ordering::SeqCst) {
+                        info!("first DoH/DoT response received — switching to encrypted-only DNS");
+                        warm.store(true, Ordering::SeqCst);
+                    }
+                    let reply = crate::dns_proxy::build_reply(orig_pkt, &dns_resp);
+                    match tun.write(&reply) {
+                        Ok(n) => debug!("DNS resolver: wrote {n} byte reply to utun"),
+                        Err(e) => warn!("DNS resolver: utun write failed: {e}"),
+                    }
+                }
+            }
+        }));
+    }
+
+    for h in handles { let _ = h.join(); }
+    
+    // Reclaim connections returned by workers
+    while let Ok(conn) = return_rx.try_recv() {
+        dot_conns.push(conn);
+    }
+    // Trim to MAX_POOL
+    dot_conns.truncate(MAX_POOL);
+}
+
 fn run_session(
     config: &TetherConfig,
     ipc: Option<&IpcServer>,
@@ -65,20 +187,17 @@ fn run_session(
 
     info!("looking for Android {} device...", drv.name());
     let usb = match UsbDevice::find_rndis() {
-        Ok(d) => Arc::new(Mutex::new(d)),
+        Ok(d) => d,
         Err(e) => {
             error!("{e}");
-            return running.load(Ordering::Relaxed);
+            return false;
         }
     };
 
     info!("initializing {}...", drv.name());
-    {
-        let usb_lock = usb.lock().unwrap();
-        if let Err(e) = drv.init(&usb_lock) {
-            error!("init failed: {e}");
-            return running.load(Ordering::Relaxed);
-        }
+    if let Err(e) = drv.init(&usb) {
+        error!("init failed: {e}");
+        return false;
     }
 
     let device_mac = drv.mac();
@@ -88,7 +207,7 @@ fn run_session(
         (static_ip, gw, config.netmask, Ipv4Addr::new(8, 8, 8, 8), Ipv4Addr::new(8, 8, 4, 4))
     } else {
         info!("performing DHCP...");
-        match discover(&usb.lock().unwrap(), &MacAddr(device_mac)) {
+        match discover(&usb, &MacAddr(device_mac)) {
             Ok(lease) => (lease.ip, lease.gateway, lease.netmask, lease.dns1, lease.dns2),
             Err(e) => {
                 warn!("DHCP failed: {e}, using defaults");
@@ -107,20 +226,26 @@ fn run_session(
         Ok(t) => Arc::new(t),
         Err(e) => {
             error!("utun creation failed: {e}");
-            return running.load(Ordering::Relaxed);
+            return false;
         }
     };
 
     if let Err(e) = tun.configure(&ip.to_string(), &gateway.to_string(), &netmask.to_string()) {
         error!("interface config failed: {e}");
-        return running.load(Ordering::Relaxed);
+        return false;
     }
 
     if !config.no_dns {
-        set_dns(dns1, dns2);
+        let (cfg_dns1, cfg_dns2) = if config.dns_mode != DnsMode::System {
+            // DoH/DoT: only configure gateway as DNS — we intercept all queries
+            (dns1, dns1)
+        } else {
+            (dns1, dns2)
+        };
+        set_dns(cfg_dns1, cfg_dns2);
         Utun::register_service(
             &tun.ifname, &ip.to_string(), &gateway.to_string(),
-            &netmask.to_string(), &dns1.to_string(), &dns2.to_string(),
+            &netmask.to_string(), &cfg_dns1.to_string(), &cfg_dns2.to_string(),
         );
     } else if !config.no_route {
         Utun::register_service(
@@ -137,11 +262,7 @@ fn run_session(
 
     let host_mac = device_mac;
 
-    let _was_bound = true;
-    {
-        let usb_lock = usb.lock().unwrap();
-        let _ = arp::send_gratuitous(&usb_lock, &host_mac, ip);
-    }
+    let _ = arp::send_gratuitous(&usb, &host_mac, ip);
 
     info!("tethering active on {} ({})", tun.ifname, ip);
     info!("gateway: {gateway}, DNS: {dns1}, {dns2}");
@@ -151,177 +272,142 @@ fn run_session(
     }
 
     let running_bridge = Arc::new(AtomicBool::new(true));
+    let device_gone = Arc::new(AtomicBool::new(false));
     let stats = Arc::new(SharedStats::default());
 
-    let drv = Arc::new(Mutex::new(drv));
+    let drv = Arc::new(drv);
 
     // Shared gateway MAC: RX thread learns it from first non-broadcast frame;
     // TX thread uses it as destination for all outgoing Ethernet frames.
     // Initialized to broadcast (matching C code approach).
     let gateway_mac = Arc::new(Mutex::new([0xFF; 6]));
 
-    // TX queue: TX thread pushes RNDIS-wrapped frames here;
-    // RX thread sends them via USB (avoids lock contention on usb).
-    let tx_queue: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+    // TX queue: bounded channel prevents accumulating packets when USB is slow
+    let (tx_sender, tx_receiver) = mpsc::sync_channel::<Vec<u8>>(4096);
 
-    // RX thread: USB (bulk in) -> RNDIS unwrap -> [ARP handling + gw MAC learning]
-    //            -> eth_to_utun -> utun write
-    //            -> also drains tx_queue and sends via USB
-    let usb_rx = usb.clone();
-    let drv_rx = drv.clone();
-    let tun_rx = tun.clone();
-    let stats_rx = stats.clone();
-    let running_rx = running.clone();
-    let bridge_rx = running_bridge.clone();
-    let host_mac_rx = host_mac;
-    let our_ip = ip;
-    let gw_mac_rx = gateway_mac.clone();
-    let tx_q_rx = tx_queue.clone();
-    let drv_rx2 = drv.clone();
-
-    let rx_handle = std::thread::spawn(move || {
-        let mut rndis_buf = [0u8; RNDIS_BUF_SIZE];
-        let mut utun_buf = [0u8; ETH_BUF_SIZE + 4];
-        let mut frame_logged: u64 = 0;
-        let mut usb_rx_err_count: u32 = 0;
-        let mut recv_zero_count: u32 = 0;
-        let mut tx_sent_count: u64 = 0;
-
-        while running_rx.load(Ordering::SeqCst) && bridge_rx.load(Ordering::SeqCst) {
-            // Receive first, then send queued TX data (prioritize RX)
-            let n = {
-                let usb_lock = usb_rx.lock().unwrap();
-                usb_lock.recv_bulk(&mut rndis_buf, 200)
+    // DNS resolver thread for DoH/DoT: avoids blocking TX thread on encrypted DNS calls
+    let (dns_sender, dns_receiver) = mpsc::channel::<(Vec<u8>, Vec<u8>)>();
+    let doh_warmed_up = Arc::new(AtomicBool::new(false));
+    let dns_handle = if config.dns_mode != DnsMode::System {
+        let dns_tun = tun.clone();
+        let dns_bridge = running_bridge.clone();
+        let dns_mode_val = config.dns_mode;
+        let dns_provider_val = config.dns_provider;
+        let doh_warm = doh_warmed_up.clone();
+        info!("starting DNS resolver thread (mode={dns_mode_val:?}, provider={dns_provider_val:?})");
+        Some(std::thread::spawn(move || {
+            let doh_agent = if matches!(dns_mode_val, DnsMode::DoH) {
+                match crate::dns_proxy::create_doh_agent(dns_provider_val) {
+                    Ok(a) => {
+                        info!("DoH agent created (connection reuse enabled)");
+                        Some(a)
+                    }
+                    Err(e) => {
+                        warn!("DoH agent creation failed: {e}");
+                        None
+                    }
+                }
+            } else {
+                None
             };
-            let n = match n {
-                Ok(0) => {
-                    recv_zero_count += 1;
-                    if recv_zero_count % 100 == 0 {
-                        debug!("USB RX: {} consecutive timeouts (0 bytes)", recv_zero_count);
-                    }
-                    0
-                }
-                Ok(n) => {
-                    usb_rx_err_count = 0;
-                    recv_zero_count = 0;
-                    n
-                }
-                Err(e) => {
-                    usb_rx_err_count += 1;
-                    if usb_rx_err_count >= 5 {
-                        debug!("USB RX error #{usb_rx_err_count}: {e}");
-                        usb_rx_err_count = 0;
-                    }
-                    0
-                }
-            };
-            if n > 0 {
-                debug!("USB bulk IN: {} bytes", n);
+            let mut dot_conns: Vec<crate::dns_proxy::DotPooledConn> = Vec::new();
 
-                let drv_lock = drv_rx.lock().unwrap();
-                let mut had_error = false;
-                let mut arp_reply = Vec::new();
-
-                let mut on_frame = |frame: &[u8]| {
-                    if had_error {
-                        return;
-                    }
-                    if frame.len() < 14 {
-                        return;
-                    }
-                    let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
-
-                    if frame_logged < 10 {
-                        debug!("RX frame #{}: ethertype=0x{ethertype:04x} len={}", frame_logged + 1, frame.len());
-                        frame_logged += 1;
-                    }
-
-                    let fsrc = &frame[6..12];
-
-                    if fsrc[0] != 0xFF {
-                        let mut gw = gw_mac_rx.lock().unwrap();
-                        if *gw != *fsrc {
-                            gw.copy_from_slice(fsrc);
-                            debug!(
-                                "gateway MAC now: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                                gw[0], gw[1], gw[2], gw[3], gw[4], gw[5]
+            while dns_bridge.load(Ordering::SeqCst) {
+                match dns_receiver.recv_timeout(std::time::Duration::from_millis(200)) {
+                    Ok((orig_pkt, dns_query)) => {
+                        if matches!(dns_mode_val, DnsMode::DoH) {
+                            // DoH: drain batch, process concurrently
+                            let mut batch = vec![(orig_pkt, dns_query)];
+                            while let Ok(item) = dns_receiver.try_recv() {
+                                batch.push(item);
+                            }
+                            debug!("DNS resolver: DoH batch of {} queries", batch.len());
+                            let agent = doh_agent.clone();
+                            let tun = dns_tun.clone();
+                            let warm = doh_warm.clone();
+                            let prov = dns_provider_val;
+                            let handles: Vec<_> = batch.into_iter().map(|(orig, query)| {
+                                let agent = agent.clone();
+                                let tun = tun.clone();
+                                let warm = warm.clone();
+                                std::thread::spawn(move || {
+                                    let resp = agent.as_ref()
+                                        .and_then(|a| crate::dns_proxy::doh_resolve(a, prov, &query));
+                                    if let Some(dns_resp) = resp {
+                                        if !warm.load(Ordering::SeqCst) {
+                                            info!("first DoH/DoT response received — switching to encrypted-only DNS");
+                                            warm.store(true, Ordering::SeqCst);
+                                        }
+                                        let reply = crate::dns_proxy::build_reply(&orig, &dns_resp);
+                                        match tun.write(&reply) {
+                                            Ok(n) => debug!("DNS resolver: wrote {n} byte reply to utun"),
+                                            Err(e) => warn!("DNS resolver: utun write failed: {e}"),
+                                        }
+                                    }
+                                })
+                            }).collect();
+                            for h in handles { let _ = h.join(); }
+                        } else {
+                            // DoT: serial with pooled connection
+                            process_dot_serial(
+                                orig_pkt, dns_query,
+                                &dns_receiver,
+                                &mut dot_conns,
+                                &dns_tun,
+                                &doh_warm,
+                                dns_provider_val,
+                                &dns_bridge,
                             );
                         }
                     }
-
-                    if ethertype == crate::net_types::ARP_ETHERTYPE {
-                        let mut reply_buf = [0u8; crate::net_types::ETH_BUF_SIZE];
-                        if let Ok(len) = arp::handle_request(frame, &mut reply_buf, &host_mac_rx, our_ip) {
-                            if len > 0 {
-                                debug!("handled ARP request, queueing reply ({} bytes)", len);
-                                arp_reply.extend_from_slice(&reply_buf[..len]);
-                            }
-                        }
-                        return;
-                    }
-
-                    match eth_to_utun(frame, &mut utun_buf) {
-                        Ok(0) => {}
-                        Ok(utun_len) => {
-                            let _ = tun_rx.write(&utun_buf[..utun_len]);
-                            stats_rx.rx_pkts.fetch_add(1, Ordering::Relaxed);
-                            stats_rx.rx_bytes.fetch_add(frame.len() as u64, Ordering::Relaxed);
-                        }
-                        Err(_) => {
-                            had_error = true;
-                        }
-                    }
-                };
-
-                if let Err(e) = drv_lock.unwrap_data(&rndis_buf[..n], &mut on_frame) {
-                    debug!("unwrap_data error: {e}");
-                }
-                drop(drv_lock);
-
-                if !arp_reply.is_empty() {
-                    let mut rndis_buf2 = [0u8; RNDIS_BUF_SIZE];
-                    {
-                        let drv_lock = drv_rx2.lock().unwrap();
-                        if let Ok(rlen) = drv_lock.wrap_frame(&arp_reply, &mut rndis_buf2) {
-                            let usb_lock = usb_rx.lock().unwrap();
-                            let _ = usb_lock.send_bulk(&rndis_buf2[..rlen]);
-                        }
-                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             }
+            info!("DNS resolver thread stopped");
+        }))
+    } else {
+        None
+    };
 
-            // Drain TX queue after processing RX
-            {
-                let packets: Vec<Vec<u8>> = tx_q_rx.lock().unwrap().drain(..).collect();
-                if !packets.is_empty() {
-                    let usb_lock = usb_rx.lock().unwrap();
-                    for pkt in &packets {
-                        match usb_lock.send_bulk(pkt) {
-                            Ok(_) => {
-                                tx_sent_count += 1;
-                                stats_rx.tx_pkts.fetch_add(1, Ordering::Relaxed);
-                                stats_rx.tx_bytes.fetch_add(pkt.len() as u64, Ordering::Relaxed);
-                            }
-                            Err(e) => {
-                                debug!("TX send_bulk failed: {e}");
-                            }
-                        }
-                    }
-                    if tx_sent_count % 50 == 0 {
-                        debug!("RX thread: {} TX packets sent to USB", tx_sent_count);
-                    }
-                }
-            }
-        }
+    // I/O thread: owns USB endpoints, handles RX (multi-URB submit/wait) + TX (drains channel)
+    let (ep_in, ep_out) = usb.take_endpoints();
+    let tun_io = tun.clone();
+    let drv_io = drv.clone();
+    let stats_io = stats.clone();
+    let bridge_io = running_bridge.clone();
+    let gw_mac_io = gateway_mac.clone();
+    let tx_receiver_io = tx_receiver;
+    let device_gone_io = device_gone.clone();
+
+    let io_handle = std::thread::spawn(move || {
+        let mut usb_io = UsbIo::new(ep_in, ep_out);
+        usb_io.run(
+            tun_io,
+            tx_receiver_io,
+            drv_io,
+            stats_io,
+            host_mac,
+            ip,
+            gw_mac_io,
+            bridge_io,
+            device_gone_io,
+        );
     });
 
-    // TX thread: utun read (poll) -> ip_to_eth -> RNDIS wrap -> push to tx_queue
+    // Main thread no longer holds USB — keepalive is sent via tx_sender
+
+    // TX thread: utun read (poll) -> ip_to_eth -> RNDIS wrap -> push to tx_sender
     let tun_tx = tun.clone();
-    let stats_tx = stats.clone();
     let bridge_tx = running_bridge.clone();
     let gw_mac_tx = gateway_mac.clone();
-    let tx_q_tx = tx_queue.clone();
+    let tx_sender_tx = tx_sender.clone();
     let drv_tx = drv.clone();
+    let dns_mode = config.dns_mode;
+    let our_ip_u32 = u32::from(ip);
+    let gw_ip_u32 = u32::from(gateway);
+    let dns_sender_tx = dns_sender.clone();
+    let doh_warm_tx = doh_warmed_up.clone();
 
     let tx_handle = std::thread::spawn(move || {
         let mut tbuf = [0u8; ETH_BUF_SIZE + 256];
@@ -329,6 +415,7 @@ fn run_session(
         let mut rbuf = [0u8; RNDIS_BUF_SIZE];
         let our_mac = host_mac;
         let fd = tun_tx.fd;
+        let mut tx_log_count: u64 = 0;
 
         while bridge_tx.load(Ordering::SeqCst) {
             let mut poll_fds = [libc::pollfd {
@@ -353,12 +440,29 @@ fn run_session(
                 if !bridge_tx.load(Ordering::SeqCst) {
                     break;
                 }
-                if tlen >= 4 {
-                    let af = u32::from_be_bytes(tbuf[..4].try_into().unwrap());
-                    if stats_tx.tx_pkts.load(Ordering::Relaxed) < 10 {
-                        let ip_proto = if tlen > 4 { tbuf[4] >> 4 } else { 0 };
-                        debug!("TX utun pkt: af={af} ip_ver={ip_proto} len={tlen}");
+
+                if dns_mode != DnsMode::System {
+                    if let Some(dns_len) = crate::dns_proxy::is_dns_to_gateway(
+                        &tbuf[..tlen], our_ip_u32, gw_ip_u32,
+                    ) {
+                        let dns_query = tbuf[tlen - dns_len..tlen].to_vec();
+                        let orig_pkt = tbuf[..tlen].to_vec();
+                        debug!("TX: intercepted DNS query ({} bytes), forwarding to resolver", dns_query.len());
+                        if dns_sender_tx.send((orig_pkt, dns_query)).is_err() {
+                            warn!("TX: DNS resolver channel full/disconnected");
+                        }
+                        if doh_warm_tx.load(Ordering::SeqCst) {
+                            continue; // DoH/DoT is active, skip phone DNS
+                        }
                     }
+                    // warming up: also forward to phone until first encrypted response arrives
+                }
+
+                if tlen >= 4 && tx_log_count < 10 {
+                    let af = u32::from_be_bytes(tbuf[..4].try_into().unwrap());
+                    let ip_proto = if tlen > 4 { tbuf[4] >> 4 } else { 0 };
+                    debug!("TX utun pkt: af={af} ip_ver={ip_proto} len={tlen}");
+                    tx_log_count += 1;
                 }
                 let gw = *gw_mac_tx.lock().unwrap();
                 let elen = match ip_to_eth(&tbuf[..tlen], &mut ebuf, &our_mac, &gw) {
@@ -369,15 +473,14 @@ fn run_session(
                     continue;
                 }
 
-                let rlen = {
-                    let drv_lock = drv_tx.lock().unwrap();
-                    match drv_lock.wrap_frame(&ebuf[..elen], &mut rbuf) {
-                        Ok(n) => n,
-                        Err(_) => continue,
-                    }
+                let rlen = match drv_tx.wrap_frame(&ebuf[..elen], &mut rbuf) {
+                    Ok(n) => n,
+                    Err(_) => continue,
                 };
 
-                tx_q_tx.lock().unwrap().push(rbuf[..rlen].to_vec());
+                if tx_sender_tx.send(rbuf[..rlen].to_vec()).is_err() {
+                    break;
+                }
             }
         }
     });
@@ -418,16 +521,13 @@ fn run_session(
                 unsafe { *(arp_buf.as_mut_ptr().add(std::mem::size_of::<EthHdr>()) as *mut ArpPacket) = arp };
                 total
             };
-            {
-                let drv_lock = drv.lock().unwrap();
-                if let Ok(rlen) = drv_lock.wrap_frame(&arp_buf[..arp_len], &mut rndis_buf) {
-                    tx_queue.lock().unwrap().push(rndis_buf[..rlen].to_vec());
-                }
+            if let Ok(rlen) = drv.wrap_frame(&arp_buf[..arp_len], &mut rndis_buf) {
+                let _ = tx_sender.try_send(rndis_buf[..rlen].to_vec());
             }
             last_keepalive = now;
         }
 
-        if now.duration_since(last_stats).as_secs() >= 1 {
+        if now.duration_since(last_stats).as_secs() >= 5 {
             let elapsed = now.duration_since(last_stats).as_secs_f64();
             if elapsed > 0.0 {
                 let cur_tx = stats.tx_bytes.load(Ordering::Relaxed);
@@ -473,36 +573,44 @@ fn run_session(
             }
         }
 
+        let _ = std::io::stderr().flush();
+
         std::thread::sleep(Duration::from_millis(100));
     }
 
     running_bridge.store(false, Ordering::SeqCst);
-    let _ = rx_handle.join();
+    if io_handle.join().is_err() {
+        warn!("IO thread panicked");
+        device_gone.store(true, Ordering::SeqCst);
+    }
     let _ = tx_handle.join();
+    if let Some(handle) = dns_handle {
+        let _ = handle.join();
+    }
 
-    if _was_bound {
-        info!("restoring network state...");
-        if !config.no_route {
-            let _ = std::process::Command::new("sh")
-                .arg("-c")
-                .arg("route delete -net 0.0.0.0/1 2>/dev/null")
-                .status();
-            let _ = std::process::Command::new("sh")
-                .arg("-c")
-                .arg("route delete -net 128.0.0.0/1 2>/dev/null")
-                .status();
-        }
-        Utun::unregister_service();
-        if !config.no_dns {
-            scutil_run("remove State:/Network/Global/DNS\nquit\n");
-        }
+    let was_disconnected = device_gone.load(Ordering::SeqCst);
+
+    info!("restoring network state...");
+    if !config.no_route {
+        let _ = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("route delete -net 0.0.0.0/1 2>/dev/null")
+            .status();
+        let _ = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("route delete -net 128.0.0.0/1 2>/dev/null")
+            .status();
+    }
+    Utun::unregister_service();
+    if !config.no_dns {
+        scutil_run("remove State:/Network/Global/DNS\nquit\n");
     }
 
     if let Some(ipc) = ipc {
         ipc.send_state("disconnected", None, None);
     }
 
-    false
+    was_disconnected
 }
 
 fn main() {
@@ -514,25 +622,56 @@ fn main() {
         }
     };
 
+    // Install/uninstall handle themselves, root check done inside
+    if config.install {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("error: --install must be run as root (use sudo)");
+            std::process::exit(1);
+        }
+        daemon::install_daemon(&config);
+        return;
+    }
+
+    if config.uninstall {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("error: --uninstall must be run as root (use sudo)");
+            std::process::exit(1);
+        }
+        daemon::uninstall_daemon();
+        return;
+    }
+
     if unsafe { libc::geteuid() } != 0 {
         eprintln!("error: this tool must be run as root (use sudo)");
         std::process::exit(1);
     }
 
-    env_logger::Builder::new()
-        .filter_level(config.log_level)
-        .format_timestamp_secs()
-        .init();
+    if config.daemon {
+        daemon::setup_daemon_logging(config.log_level == log::LevelFilter::Debug);
+    } else {
+        env_logger::Builder::new()
+            .filter_level(config.log_level)
+            .format_timestamp_secs()
+            .init();
+    }
 
     let running = Arc::new(AtomicBool::new(true));
 
     let r = running.clone();
     ctrlc::set_handler(move || {
         r.store(false, Ordering::SeqCst);
+        GLOBAL_RUNNING.store(false, Ordering::SeqCst);
     })
     .expect("failed to set Ctrl-C handler");
 
-    info!("=== Android USB Tethering for macOS (Rust) ===");
+    // Handle SIGTERM for launchd shutdown
+    unsafe {
+        libc::signal(libc::SIGTERM, sigterm_handler as libc::sighandler_t);
+    }
+
+    if !config.daemon {
+        info!("=== Android USB Tethering for macOS (Rust) ===");
+    }
 
     let ipc = IpcServer::new();
     let ipc_opt: Option<&IpcServer> = if config.watch_mode { Some(&ipc) } else { None };
@@ -540,7 +679,7 @@ fn main() {
     if config.watch_mode {
         ipc.send_state("idle", None, None);
 
-        while running.load(Ordering::Relaxed) {
+        while is_running(&running) {
             if let Some(ipc) = ipc_opt {
                 match ipc.poll() {
                     IpcCommand::Disable => {
@@ -559,25 +698,25 @@ fn main() {
             }
 
             let reconnected = run_session(&config, ipc_opt, &running);
-            if reconnected && running.load(Ordering::Relaxed) {
+            if reconnected && is_running(&running) {
                 info!("device disconnected, waiting for reconnect...");
                 if let Some(ipc) = ipc_opt {
                     ipc.send_state("watching", None, None);
                 }
                 for _ in 0..6 {
-                    if !running.load(Ordering::Relaxed) {
+                    if !is_running(&running) {
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(500));
                 }
-            } else if running.load(Ordering::Relaxed) {
+            } else if is_running(&running) {
                 std::thread::sleep(Duration::from_millis(1000));
             }
         }
     } else {
         run_session(&config, ipc_opt, &running);
 
-        while running.load(Ordering::Relaxed) {
+        while is_running(&running) {
             if let Some(ipc) = ipc_opt {
                 if ipc.poll() == IpcCommand::Stop {
                     break;

@@ -18,6 +18,7 @@ pub const RNDIS_MSG_RESET: u32 = 0x00000006;
 pub const RNDIS_MSG_RESET_C: u32 = 0x80000006;
 #[allow(dead_code)]
 pub const RNDIS_MSG_INDICATE: u32 = 0x00000001;
+#[allow(dead_code)]
 pub const RNDIS_MSG_KEEPALIVE: u32 = 0x00000008;
 #[allow(dead_code)]
 pub const RNDIS_MSG_KEEPALIVE_C: u32 = 0x80000008;
@@ -215,6 +216,7 @@ pub fn parse_set_cmplt(buf: &[u8]) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn build_keepalive(buf: &mut [u8], state: &mut RndisState) -> Result<usize> {
     let msg_size = 12;
     if buf.len() < msg_size {
@@ -270,30 +272,41 @@ impl<'a> Iterator for RndisPacketIter<'a> {
     type Item = &'a [u8];
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.offset + 8 > self.data.len() {
-            return None;
-        }
-        let msg_len = read_u32(self.data, self.offset + 4) as usize;
-        if msg_len == 0 || self.offset + msg_len > self.data.len() {
-            return None;
-        }
-        let pkt_data = &self.data[self.offset..self.offset + msg_len];
-        self.offset += msg_len;
+        loop {
+            if self.offset + 8 > self.data.len() {
+                return None;
+            }
+            let msg_len = read_u32(self.data, self.offset + 4) as usize;
+            if msg_len == 0 || self.offset + msg_len > self.data.len() {
+                return None;
+            }
+            let pkt_data = &self.data[self.offset..self.offset + msg_len];
+            self.offset += msg_len;
 
-        if pkt_data.len() < 44 {
-            return None;
+            if pkt_data.len() < 8 {
+                continue;
+            }
+            let dp_msg_type = read_u32(pkt_data, 0);
+            if dp_msg_type != RNDIS_MSG_PACKET {
+                continue;
+            }
+            if pkt_data.len() < 44 {
+                continue;
+            }
+            let dp_data_offset = read_u32(pkt_data, 8);
+            let dp_data_len = read_u32(pkt_data, 12);
+            // Data packets have DataOffset >= 36 and DataLength > 0.
+            // Indication messages use the same type byte but have Status at offset 8 and
+            // StatusBufferLength at offset 12 — these won't pass this check.
+            if dp_data_offset < 36 || dp_data_len == 0 {
+                continue;
+            }
+            let data_start = (8 + dp_data_offset) as usize;
+            let data_end = data_start + dp_data_len as usize;
+            if data_end > pkt_data.len() {
+                continue;
+            }
+            return Some(&pkt_data[data_start..data_end]);
         }
-        let dp_msg_type = read_u32(pkt_data, 0);
-        let dp_data_len = read_u32(pkt_data, 12);
-        let dp_data_offset = read_u32(pkt_data, 8);
-        if dp_msg_type != RNDIS_MSG_PACKET || dp_data_len == 0 {
-            return None;
-        }
-        let data_start = (8 + dp_data_offset) as usize;
-        let data_end = data_start + dp_data_len as usize;
-        if data_end > pkt_data.len() {
-            return None;
-        }
-        Some(&pkt_data[data_start..data_end])
     }
 }

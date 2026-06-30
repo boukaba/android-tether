@@ -257,7 +257,7 @@ pub fn discover(usb: &UsbDevice, mac: &MacAddr) -> Result<DhcpLease> {
         };
 
         let on_frame = &mut process_frame;
-        let _ = rndis::RndisPacketIter::new(&rndis_buf[..n]).for_each(|f| on_frame(f));
+        rndis::RndisPacketIter::new(&rndis_buf[..n]).for_each(on_frame);
 
         if offered_addr.is_some() {
             break;
@@ -342,7 +342,7 @@ pub fn discover(usb: &UsbDevice, mac: &MacAddr) -> Result<DhcpLease> {
             };
 
             let on_frame = &mut process_ack;
-            let _ = rndis::RndisPacketIter::new(&rndis_buf[..n]).for_each(|f| on_frame(f));
+            rndis::RndisPacketIter::new(&rndis_buf[..n]).for_each(on_frame);
         }
 
         if let Some(lease) = result_lease {

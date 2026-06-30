@@ -1,26 +1,29 @@
 use crate::error::{Result, TetherError};
 use log::{info, warn};
-use rusb::{Context, DeviceDescriptor, DeviceHandle, UsbContext};
+use nusb::{
+    descriptors::TransferType,
+    transfer::{Bulk, ControlIn, ControlOut, ControlType, In, Out, Recipient, TransferError},
+    Device, Endpoint, Interface, MaybeFuture,
+};
+use std::time::Duration;
 
-pub const USB_CTRL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-pub const USB_BULK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+pub const USB_CTRL_TIMEOUT: Duration = Duration::from_secs(5);
+pub const USB_BULK_TIMEOUT: Duration = Duration::from_millis(500);
 
 const CDC_SEND_ENCAPSULATED: u8 = 0x00;
 const CDC_GET_ENCAPSULATED: u8 = 0x01;
 
 pub struct UsbDevice {
-    pub handle: DeviceHandle<Context>,
-    pub iface_comm: u8,
+    _device: Device,
+    iface_comm: Interface,
+    iface_data: Option<Interface>,
+    pub ep_in_addr: u8,
+    pub ep_out_addr: u8,
     #[allow(dead_code)]
-    pub iface_data: u8,
-    pub ep_in: u8,
-    pub ep_out: u8,
+    pub ep_int_addr: u8,
+    pub comm_iface: u8,
     #[allow(dead_code)]
-    pub ep_int: u8,
-    #[allow(dead_code)]
-    pub vid: u16,
-    #[allow(dead_code)]
-    pub pid: u16,
+    pub data_iface: u8,
 }
 
 impl UsbDevice {
@@ -39,16 +42,18 @@ impl UsbDevice {
     }
 
     pub fn find_rndis() -> Result<Self> {
-        let context: Context = Context::new()?;
-        let devices = context.devices()?;
+        let device_list = nusb::list_devices().wait().map_err(TetherError::Usb)?;
 
-        for device in devices.iter() {
-            let desc: DeviceDescriptor = match device.device_descriptor() {
+        for dev_info in device_list {
+            let vid = dev_info.vendor_id();
+            let pid = dev_info.product_id();
+
+            let device = match dev_info.open().wait() {
                 Ok(d) => d,
                 Err(_) => continue,
             };
 
-            let config = match device.active_config_descriptor() {
+            let config = match device.active_configuration() {
                 Ok(c) => c,
                 Err(_) => continue,
             };
@@ -56,31 +61,20 @@ impl UsbDevice {
             let mut comm_iface = None;
             let mut data_iface = None;
 
-            for iface in config.interfaces() {
-                for alt in iface.descriptors() {
-                    if Self::is_rndis_interface(
-                        alt.class_code(),
-                        alt.sub_class_code(),
-                        alt.protocol_code(),
-                    ) {
-                        comm_iface = Some(alt.interface_number());
+            for ifaces in config.interfaces() {
+                for alt in ifaces.alt_settings() {
+                    let inum = alt.interface_number();
+                    let class = alt.class();
+                    let subclass = alt.subclass();
+                    let protocol = alt.protocol();
+                    if Self::is_rndis_interface(class, subclass, protocol) {
+                        comm_iface = Some(inum);
                         info!(
-                            "found RNDIS comm interface {} on {:04x}:{:04x} (class={:02x} sub={:02x} proto={:02x})",
-                            alt.interface_number(),
-                            desc.vendor_id(),
-                            desc.product_id(),
-                            alt.class_code(),
-                            alt.sub_class_code(),
-                            alt.protocol_code(),
+                            "found RNDIS comm interface {inum} on {vid:04x}:{pid:04x} (class={class:02x} sub={subclass:02x} proto={protocol:02x})"
                         );
                     }
-                    if Self::is_data_interface(
-                        alt.class_code(),
-                        alt.sub_class_code(),
-                        alt.protocol_code(),
-                    ) && comm_iface.is_some()
-                    {
-                        data_iface = Some(alt.interface_number());
+                    if Self::is_data_interface(class, subclass, protocol) && comm_iface.is_some() {
+                        data_iface = Some(inum);
                     }
                 }
             }
@@ -95,51 +89,41 @@ impl UsbDevice {
                 Some(d) => d,
                 None => continue,
             };
+            let comm_iface = comm_iface.unwrap();
 
-            let handle: DeviceHandle<Context> = match device.open() {
-                Ok(h) => h,
+            let iface_comm = match device.detach_and_claim_interface(comm_iface).wait() {
+                Ok(i) => i,
                 Err(e) => {
-                    warn!("failed to open device: {e}");
+                    warn!("failed to claim comm interface: {e}");
                     continue;
                 }
             };
 
-            if handle.kernel_driver_active(comm_iface.unwrap()).unwrap_or(false) {
-                let _ = handle.detach_kernel_driver(comm_iface.unwrap());
-            }
-            if handle.kernel_driver_active(data_iface).unwrap_or(false) {
-                let _ = handle.detach_kernel_driver(data_iface);
-            }
-
-            if handle.claim_interface(comm_iface.unwrap()).is_err() {
-                warn!("failed to claim comm interface, skipping");
-                continue;
-            }
-            if handle.claim_interface(data_iface).is_err() {
-                let _ = handle.release_interface(comm_iface.unwrap());
-                warn!("failed to claim data interface, skipping");
-                continue;
-            }
+            let iface_data = match device.claim_interface(data_iface).wait() {
+                Ok(i) => Some(i),
+                Err(e) => {
+                    warn!("failed to claim data interface: {e}");
+                    continue;
+                }
+            };
 
             let mut ep_in = 0;
             let mut ep_out = 0;
             let mut ep_int = 0;
 
-            for iface in config.interfaces() {
-                for alt in iface.descriptors() {
+            for ifaces in config.interfaces() {
+                for alt in ifaces.alt_settings() {
                     let inum = alt.interface_number();
-                    if inum != comm_iface.unwrap() && inum != data_iface {
+                    if inum != comm_iface && inum != data_iface {
                         continue;
                     }
-                    let is_comm = inum == comm_iface.unwrap();
-                    for ep in alt.endpoint_descriptors() {
-                        let ep_addr = ep.address();
-                        let dir = ep_addr & 0x80;
-                        let tp = ep.transfer_type();
-                        match (tp, dir, is_comm) {
-                            (rusb::TransferType::Interrupt, _, true) => ep_int = ep_addr,
-                            (rusb::TransferType::Bulk, 0x80, _) => ep_in = ep_addr,
-                            (rusb::TransferType::Bulk, 0x00, _) => ep_out = ep_addr,
+                    for ep_desc in alt.endpoints() {
+                        let addr = ep_desc.address();
+                        let dir = addr & 0x80;
+                        match (ep_desc.transfer_type(), dir, inum == comm_iface) {
+                            (TransferType::Interrupt, _, true) => ep_int = addr,
+                            (TransferType::Bulk, 0x80, _) => ep_in = addr,
+                            (TransferType::Bulk, 0x00, _) => ep_out = addr,
                             _ => {}
                         }
                     }
@@ -147,22 +131,24 @@ impl UsbDevice {
             }
 
             if ep_in == 0 || ep_out == 0 {
-                if let Ok(()) = handle.set_alternate_setting(data_iface, 1) {
-                    if let Ok(config2) = device.active_config_descriptor() {
-                        for iface in config2.interfaces() {
-                            for alt in iface.descriptors() {
-                                if alt.interface_number() != data_iface
-                                    || alt.setting_number() != 1
-                                {
-                                    continue;
-                                }
-                                for ep in alt.endpoint_descriptors() {
-                                    let ep_addr = ep.address();
-                                    let dir = ep_addr & 0x80;
-                                    if ep.transfer_type() == rusb::TransferType::Bulk {
-                                        match dir {
-                                            0x80 => ep_in = ep_addr,
-                                            _ => ep_out = ep_addr,
+                if let Some(ref iface_data) = iface_data {
+                    if let Ok(()) = iface_data.set_alt_setting(1).wait() {
+                        if let Ok(config2) = device.active_configuration() {
+                            for ifaces in config2.interfaces() {
+                                for alt in ifaces.alt_settings() {
+                                    if alt.interface_number() != data_iface
+                                        || alt.alternate_setting() != 1
+                                    {
+                                        continue;
+                                    }
+                                    for ep_desc in alt.endpoints() {
+                                        let addr = ep_desc.address();
+                                        let dir = addr & 0x80;
+                                        if ep_desc.transfer_type() == TransferType::Bulk {
+                                            match dir {
+                                                0x80 => ep_in = addr,
+                                                _ => ep_out = addr,
+                                            }
                                         }
                                     }
                                 }
@@ -172,30 +158,24 @@ impl UsbDevice {
                 }
             }
 
-            info!(
-                "endpoints: IN=0x{ep_in:02x} OUT=0x{ep_out:02x} INT=0x{ep_int:02x}"
-            );
+            info!("endpoints: IN=0x{ep_in:02x} OUT=0x{ep_out:02x} INT=0x{ep_int:02x}");
 
             if ep_in != 0 && ep_out != 0 {
-                info!(
-                    "opened device {:04x}:{:04x}",
-                    desc.vendor_id(),
-                    desc.product_id()
-                );
+                info!("opened device {vid:04x}:{pid:04x}");
                 return Ok(Self {
-                    handle,
-                    iface_comm: comm_iface.unwrap(),
-                    iface_data: data_iface,
-                    ep_in,
-                    ep_out,
-                    ep_int,
-                    vid: desc.vendor_id(),
-                    pid: desc.product_id(),
+                    _device: device,
+                    iface_comm,
+                    iface_data,
+                    ep_in_addr: ep_in,
+                    ep_out_addr: ep_out,
+                    ep_int_addr: ep_int,
+                    comm_iface,
+                    data_iface,
                 });
             }
 
-            let _ = handle.release_interface(data_iface);
-            let _ = handle.release_interface(comm_iface.unwrap());
+            drop(iface_data);
+            drop(iface_comm);
         }
 
         Err(TetherError::DeviceNotFound(
@@ -204,65 +184,102 @@ impl UsbDevice {
     }
 
     pub fn send_ctrl(&self, data: &[u8]) -> Result<usize> {
-        let n = self.handle.write_control(
-            0x21,
-            CDC_SEND_ENCAPSULATED,
-            0,
-            self.iface_comm as u16,
-            data,
-            USB_CTRL_TIMEOUT,
-        )?;
-        Ok(n)
+        self.iface_comm
+            .control_out(
+                ControlOut {
+                    control_type: ControlType::Class,
+                    recipient: Recipient::Interface,
+                    request: CDC_SEND_ENCAPSULATED,
+                    value: 0,
+                    index: self.comm_iface as u16,
+                    data,
+                },
+                USB_CTRL_TIMEOUT,
+            )
+            .wait()?;
+        Ok(data.len())
     }
 
     pub fn recv_ctrl(&self, buf: &mut [u8]) -> Result<usize> {
-        let n = self.handle.read_control(
-            0xA1,
-            CDC_GET_ENCAPSULATED,
-            0,
-            self.iface_comm as u16,
-            buf,
-            USB_CTRL_TIMEOUT,
-        )?;
+        let response: Vec<u8> = self
+            .iface_comm
+            .control_in(
+                ControlIn {
+                    control_type: ControlType::Class,
+                    recipient: Recipient::Interface,
+                    request: CDC_GET_ENCAPSULATED,
+                    value: 0,
+                    index: self.comm_iface as u16,
+                    length: buf.len() as u16,
+                },
+                USB_CTRL_TIMEOUT,
+            )
+            .wait()?;
+        let n = response.len().min(buf.len());
+        buf[..n].copy_from_slice(&response[..n]);
         Ok(n)
     }
 
     pub fn send_bulk(&self, data: &[u8]) -> Result<usize> {
-        let n = self
-            .handle
-            .write_bulk(self.ep_out, data, USB_BULK_TIMEOUT)?;
-        Ok(n)
+        let ref_iface = self.iface_data.as_ref().unwrap_or(&self.iface_comm);
+        let mut ep_out: Endpoint<Bulk, Out> = ref_iface.endpoint(self.ep_out_addr)?;
+        let mut buf = nusb::transfer::Buffer::new(data.len());
+        buf.extend_from_slice(data);
+        let completion = ep_out.transfer_blocking(buf, USB_BULK_TIMEOUT);
+        completion.into_result()?;
+        Ok(data.len())
     }
 
     pub fn recv_bulk(&self, buf: &mut [u8], timeout_ms: u64) -> Result<usize> {
-        let timeout = std::time::Duration::from_millis(timeout_ms);
-        match self.handle.read_bulk(self.ep_in, buf, timeout) {
-            Ok(n) => Ok(n),
-            Err(rusb::Error::Timeout) => Ok(0),
+        let ref_iface = self.iface_data.as_ref().unwrap_or(&self.iface_comm);
+        let mut ep_in: Endpoint<Bulk, In> = ref_iface.endpoint(self.ep_in_addr)?;
+        let max_pkt = ep_in.max_packet_size();
+        let requested = buf.len().div_ceil(max_pkt) * max_pkt;
+        let xfer_buf = nusb::transfer::Buffer::new(requested);
+        let completion = ep_in.transfer_blocking(xfer_buf, Duration::from_millis(timeout_ms));
+        match completion.status {
+            Ok(()) => {
+                let n = completion.actual_len;
+                let copy_len = n.min(buf.len());
+                buf[..copy_len].copy_from_slice(&completion.buffer[..copy_len]);
+                Ok(copy_len)
+            }
+            Err(TransferError::Cancelled) => Ok(0),
             Err(e) => Err(e.into()),
         }
     }
 
     #[allow(dead_code)]
     pub fn recv_int(&self, buf: &mut [u8], timeout_ms: u64) -> Result<usize> {
-        if self.ep_int == 0 {
+        if self.ep_int_addr == 0 {
             return Ok(0);
         }
-        let timeout = std::time::Duration::from_millis(timeout_ms);
-        match self.handle.read_interrupt(self.ep_int, buf, timeout) {
-            Ok(n) => Ok(n),
-            Err(rusb::Error::Timeout) => Ok(0),
+        let mut ep_int: Endpoint<nusb::transfer::Interrupt, In> =
+            self.iface_comm.endpoint(self.ep_int_addr)?;
+        let max_pkt = ep_int.max_packet_size();
+        let requested = buf.len().div_ceil(max_pkt) * max_pkt;
+        let xfer_buf = nusb::transfer::Buffer::new(requested);
+        let completion = ep_int.transfer_blocking(xfer_buf, Duration::from_millis(timeout_ms));
+        match completion.status {
+            Ok(()) => {
+                let n = completion.actual_len;
+                let copy_len = n.min(buf.len());
+                buf[..copy_len].copy_from_slice(&completion.buffer[..copy_len]);
+                Ok(copy_len)
+            }
+            Err(TransferError::Cancelled) => Ok(0),
             Err(e) => Err(e.into()),
         }
     }
 
-}
-
-impl Drop for UsbDevice {
-    fn drop(&mut self) {
-        let _ = self.handle.release_interface(self.iface_data);
-        let _ = self.handle.release_interface(self.iface_comm);
+    pub fn take_endpoints(&self) -> (Endpoint<Bulk, In>, Endpoint<Bulk, Out>) {
+        let ref_iface = self.iface_data.as_ref().unwrap_or(&self.iface_comm);
+        let ep_in: Endpoint<Bulk, In> = ref_iface
+            .endpoint(self.ep_in_addr)
+            .expect("bulk IN endpoint");
+        let ep_out: Endpoint<Bulk, Out> = ref_iface
+            .endpoint(self.ep_out_addr)
+            .expect("bulk OUT endpoint");
+        (ep_in, ep_out)
     }
 }
-
-unsafe impl Send for UsbDevice {}

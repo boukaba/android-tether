@@ -4,7 +4,10 @@ use std::net::Ipv4Addr;
 #[allow(dead_code)]
 pub enum TetherError {
     #[error("USB error: {0}")]
-    Usb(#[from] rusb::Error),
+    Usb(#[from] nusb::Error),
+
+    #[error("USB transfer error: {0}")]
+    UsbTransfer(#[from] nusb::transfer::TransferError),
 
     #[error("RNDIS protocol error: {0}")]
     Rndis(String),
