@@ -159,8 +159,8 @@ fn get_provider(provider: DnsProvider) -> DnscryptProvider {
                 ]),
                 addr: "208.67.220.220:443".parse().unwrap(),
                 provider_name: "2.dnscrypt-cert.opendns.com",
-                // Magic: "r6fnx04" — from the 12-byte short cert response
-                client_magic: [0x72, 0x36, 0x66, 0x6e, 0x78, 0x30, 0x34, 0xff],
+                // Cisco short cert uses all-zeros client magic
+                client_magic: [0u8; 8],
             }
         }
     }
