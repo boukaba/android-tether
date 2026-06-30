@@ -21,3 +21,4 @@ dirs-next = "2"
 ctrlc = "3"
 ureq = { version = "2", default-features = false, features = ["native-tls"] }
 native-tls = "0.2"
+dryoc = { version = "0.8", features = ["base64"] }
