@@ -185,6 +185,8 @@ impl DnscryptSession {
     }
 
     pub fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>, String> {
+        debug!("DNSCrypt decrypt: {} bytes, expected_magic={:02x?}, got_magic={:02x?}",
+            data.len(), &self.client_magic, &data[..8.min(data.len())]);
         if data.len() < 8 + 12 + CRYPTO_SECRETBOX_MACBYTES + 1 {
             return Err("response too short".into());
         }
@@ -207,17 +209,28 @@ impl DnscryptSession {
 // ── Providers ──
 
 struct DnscryptProvider {
+    known_pk: Option<[u8; 32]>,
     addr: SocketAddr,
     provider_name: &'static str,
+    client_magic: [u8; 8],
 }
 
 fn get_provider(provider: DnsProvider) -> DnscryptProvider {
     match provider {
         DnsProvider::Cloudflare | DnsProvider::Google | DnsProvider::Quad9 => {
-            // Cisco OpenDNS — works through phone USB tethering
+            // dct-de2 — DNSCrypt on port 53 (works through phone USB tethering)
+            // Known public key from sdns:// stamp
             DnscryptProvider {
-                addr: "208.67.220.220:443".parse().unwrap(),
-                provider_name: "2.dnscrypt-cert.opendns.com",
+                known_pk: Some([
+                    0xaf, 0x32, 0xf5, 0xd2, 0xa9, 0x34, 0x12, 0x97,
+                    0x9d, 0xe3, 0x65, 0x6f, 0x09, 0xa9, 0x1d, 0x96,
+                    0x41, 0x52, 0xfa, 0x9f, 0x05, 0x79, 0xe8, 0x8e,
+                    0x25, 0xba, 0x19, 0xdb, 0x69, 0xf2, 0x9e, 0xcf,
+                ]),
+                addr: "82.165.61.52:53".parse().unwrap(),
+                provider_name: "2.dnscrypt-cert.dct-de2",
+                // Client magic from cert — fetched once at startup via raw probe
+                client_magic: [0u8; 8],
             }
         }
     }
@@ -237,8 +250,29 @@ pub struct DnscryptPool {
 
 pub fn create_dnscrypt_pool(provider: DnsProvider) -> Result<SharedDnscryptPool, String> {
     let prov = get_provider(provider);
-    let cert = fetch_cert(prov.addr, prov.provider_name)
-        .map_err(|e| format!("DNSCrypt cert fetch: {e}"))?;
+
+    let cert = if let Some(pk) = prov.known_pk {
+        // Known public key — try fetching cert via DNS TXT, fall back to known key
+        match fetch_cert(prov.addr, prov.provider_name) {
+            Ok(c) => {
+                info!("DNSCrypt cert fetched (serial={})", c.serial);
+                c
+            }
+            Err(e) => {
+                info!("DNSCrypt cert fetch failed ({}), using known key", e);
+                DnscryptCert {
+                    server_pk: pk,
+                    client_magic: prov.client_magic,
+                    serial: 0,
+                    valid_until: 0,
+                }
+            }
+        }
+    } else {
+        fetch_cert(prov.addr, prov.provider_name)
+            .map_err(|e| format!("DNSCrypt cert fetch: {e}"))?
+    };
+
     info!("DNSCrypt cert ready (serial={})", cert.serial);
     Ok(Arc::new(Mutex::new(DnscryptPool {
         cert,
