@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const CERT_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
-const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+const QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 const KEY_LIFETIME: Duration = Duration::from_secs(3600);
 
 // ── Certificate ──

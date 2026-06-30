@@ -47,6 +47,14 @@ fn is_running(running: &AtomicBool) -> bool {
 // (fn set_dns, etc. remain below)
 use std::time::Duration;
 
+/// DNS query for `opendns.com` type A — used to pre-warm encrypted DNS connections
+const ROOT_DNS_QUERY: &[u8] = &[
+    0x00, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x07, b'o', b'p', b'e',
+    b'n', b'd', b'n', b's', 0x03, b'c', b'o', b'm',
+    0x00, 0x00, 0x01, 0x00, 0x01,
+];
+
 fn scutil_run(script: &str) {
     use std::io::Write;
     if let Ok(mut child) = std::process::Command::new("scutil")
@@ -301,6 +309,12 @@ fn run_session(
                 match crate::dns_proxy::create_doh_agent(dns_provider_val) {
                     Ok(a) => {
                         info!("DoH agent created (connection reuse enabled)");
+                        // Pre-warm with a root DNS query
+                        let warmup = ROOT_DNS_QUERY;
+                        if let Some(_) = crate::dns_proxy::doh_resolve(&a, dns_provider_val, warmup) {
+                            info!("DoH pre-warmed — encrypted-only from first query");
+                            doh_warm.store(true, Ordering::SeqCst);
+                        }
                         Some(a)
                     }
                     Err(e) => {
@@ -312,10 +326,31 @@ fn run_session(
                 None
             };
             let mut dot_conns: Vec<crate::dns_proxy::DotPooledConn> = Vec::new();
+
+            // Pre-warm DoT connection pool
+            if matches!(dns_mode_val, DnsMode::DoT) {
+                match crate::dns_proxy::create_dot_conn(dns_provider_val) {
+                    Ok(mut conn) => {
+                        if crate::dns_proxy::dot_query_pooled(&mut conn, ROOT_DNS_QUERY).is_ok() {
+                            info!("DoT pre-warmed — encrypted-only from first query");
+                            dot_conns.push(conn);
+                            doh_warm.store(true, Ordering::SeqCst);
+                        }
+                    }
+                    Err(e) => warn!("DoT warm-up failed: {e}"),
+                }
+            }
+
             let dnscrypt_pool = if matches!(dns_mode_val, DnsMode::Dnscrypt) {
                 match crate::dnscrypt::create_dnscrypt_pool(dns_provider_val) {
                     Ok(p) => {
                         info!("DNSCrypt cert fetched, connection pool ready");
+                        if let Some(_) = p.lock().unwrap().resolve(ROOT_DNS_QUERY) {
+                            info!("DNSCrypt pre-warmed — encrypted-only from first query");
+                            doh_warm.store(true, Ordering::SeqCst);
+                        } else {
+                            warn!("DNSCrypt warm-up failed — falling back to phone DNS");
+                        }
                         Some(p)
                     }
                     Err(e) => {
