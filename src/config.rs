@@ -9,7 +9,6 @@ pub enum DnsMode {
     System,
     DoH,
     DoT,
-    Dnscrypt,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -228,7 +227,6 @@ fn parse_dns_mode(s: &str) -> DnsMode {
     match s.to_lowercase().as_str() {
         "doh" => DnsMode::DoH,
         "dot" => DnsMode::DoT,
-        "dnscrypt" => DnsMode::Dnscrypt,
         _ => DnsMode::System,
     }
 }

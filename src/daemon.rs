@@ -210,7 +210,6 @@ fn dns_mode_flag(config: &TetherConfig) -> &'static str {
         crate::config::DnsMode::System => "system",
         crate::config::DnsMode::DoH => "doh",
         crate::config::DnsMode::DoT => "dot",
-        crate::config::DnsMode::Dnscrypt => "dnscrypt",
     }
 }
 

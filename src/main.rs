@@ -3,7 +3,6 @@ mod config;
 mod daemon;
 mod dhcp;
 mod dns_proxy;
-mod dnscrypt;
 mod error;
 mod frame;
 mod ipc;
@@ -341,26 +340,6 @@ fn run_session(
                 }
             }
 
-            let dnscrypt_pool = if matches!(dns_mode_val, DnsMode::Dnscrypt) {
-                match crate::dnscrypt::create_dnscrypt_pool(dns_provider_val) {
-                    Ok(p) => {
-                        info!("DNSCrypt cert fetched, connection pool ready");
-                        if let Some(_) = p.lock().unwrap().resolve(ROOT_DNS_QUERY) {
-                            info!("DNSCrypt pre-warmed — encrypted-only from first query");
-                            doh_warm.store(true, Ordering::SeqCst);
-                        } else {
-                            warn!("DNSCrypt warm-up failed — falling back to phone DNS");
-                        }
-                        Some(p)
-                    }
-                    Err(e) => {
-                        warn!("DNSCrypt init failed: {e}");
-                        None
-                    }
-                }
-            } else {
-                None
-            };
 
             while dns_bridge.load(Ordering::SeqCst) {
                 match dns_receiver.recv_timeout(std::time::Duration::from_millis(200)) {
@@ -397,38 +376,7 @@ fn run_session(
                                 })
                             }).collect();
                             for h in handles { let _ = h.join(); }
-                        } else if matches!(dns_mode_val, DnsMode::Dnscrypt) {
-                            // DNSCrypt: batch with shared session (serial queries via shared key)
-                            let mut batch = vec![(orig_pkt, dns_query)];
-                            while let Ok(item) = dns_receiver.try_recv() {
-                                batch.push(item);
-                            }
-                            debug!("DNS resolver: DNSCrypt batch of {} queries", batch.len());
-                            let pool = dnscrypt_pool.clone();
-                            let tun = dns_tun.clone();
-                            let warm = doh_warm.clone();
-                            let handles: Vec<_> = batch.into_iter().map(|(orig, query)| {
-                                let pool = pool.clone();
-                                let tun = tun.clone();
-                                let warm = warm.clone();
-                                std::thread::spawn(move || {
-                                    let resp = pool.as_ref().and_then(|p| {
-                                        p.lock().unwrap().query(&query).ok()
-                                    });
-                                    if let Some(dns_resp) = resp {
-                                        if !warm.load(Ordering::SeqCst) {
-                                            info!("first encrypted DNS response received — switching to encrypted-only DNS");
-                                            warm.store(true, Ordering::SeqCst);
-                                        }
-                                        let reply = crate::dns_proxy::build_reply(&orig, &dns_resp);
-                                        match tun.write(&reply) {
-                                            Ok(n) => debug!("DNS resolver: wrote {n} byte reply to utun"),
-                                            Err(e) => warn!("DNS resolver: utun write failed: {e}"),
-                                        }
-                                    }
-                                })
-                            }).collect();
-                            for h in handles { let _ = h.join(); }
+
                         } else {
                             // DoT: serial with pooled connection
                             process_dot_serial(
