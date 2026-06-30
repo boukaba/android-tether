@@ -139,24 +139,30 @@ impl DnscryptSession {
 // ── Providers ──
 
 struct DnscryptProvider {
+    known_pk: Option<[u8; 32]>,
     addr: SocketAddr,
     provider_name: &'static str,
+    client_magic: [u8; 8],
 }
 
 fn get_provider(provider: DnsProvider) -> DnscryptProvider {
     match provider {
-        DnsProvider::Cloudflare => DnscryptProvider {
-            addr: "1.1.1.1:443".parse().unwrap(),
-            provider_name: "cloudflare-dns.com",
-        },
-        DnsProvider::Google => DnscryptProvider {
-            addr: "8.8.8.8:443".parse().unwrap(),
-            provider_name: "dns.google",
-        },
-        DnsProvider::Quad9 => DnscryptProvider {
-            addr: "9.9.9.9:443".parse().unwrap(),
-            provider_name: "dns.quad9.net",
-        },
+        DnsProvider::Cloudflare | DnsProvider::Google | DnsProvider::Quad9 => {
+            // Cisco OpenDNS — actually works on UDP 443 through phone tethering
+            DnscryptProvider {
+                // Known public key for Cisco OpenDNS (from dnscrypt.info stamp list)
+                known_pk: Some([
+                    0xb7, 0x35, 0x11, 0x40, 0x20, 0x6f, 0x22, 0x5d,
+                    0x3e, 0x2b, 0xd8, 0x22, 0xd7, 0xfd, 0x69, 0x1e,
+                    0xa1, 0xc3, 0x3c, 0xc8, 0xd6, 0x66, 0x8d, 0x0c,
+                    0xbe, 0x04, 0xbf, 0xab, 0xca, 0x43, 0xfb, 0x79,
+                ]),
+                addr: "208.67.220.220:443".parse().unwrap(),
+                provider_name: "2.dnscrypt-cert.opendns.com",
+                // Magic: "r6fnx04" — from the 12-byte short cert response
+                client_magic: [0x72, 0x36, 0x66, 0x6e, 0x78, 0x30, 0x34, 0xff],
+            }
+        }
     }
 }
 
@@ -174,9 +180,22 @@ pub struct DnscryptPool {
 
 pub fn create_dnscrypt_pool(provider: DnsProvider) -> Result<SharedDnscryptPool, String> {
     let prov = get_provider(provider);
-    let cert = fetch_cert(prov.addr, prov.provider_name)
-        .map_err(|e| format!("DNSCrypt cert fetch: {e}"))?;
-    info!("DNSCrypt cert ready for {} (serial={})", prov.provider_name, cert.serial);
+
+    let cert = if let Some(pk) = prov.known_pk {
+        // Use hardcoded public key (short cert format — Cisco, etc.)
+        info!("DNSCrypt using known key for {} ({})", prov.provider_name, prov.addr);
+        DnscryptCert {
+            server_pk: pk,
+            client_magic: prov.client_magic,
+            serial: 0,
+            valid_until: 0,
+        }
+    } else {
+        fetch_cert(prov.addr, prov.provider_name)
+            .map_err(|e| format!("DNSCrypt cert fetch: {e}"))?
+    };
+    info!("DNSCrypt cert ready (serial={})", cert.serial);
+
     Ok(Arc::new(Mutex::new(DnscryptPool {
         cert,
         session: None,
