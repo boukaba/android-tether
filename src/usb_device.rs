@@ -1,5 +1,5 @@
 use crate::error::{Result, TetherError};
-use log::{info, warn};
+use log::{debug, info, warn};
 use nusb::{
     descriptors::TransferType,
     transfer::{Bulk, ControlIn, ControlOut, ControlType, In, Out, Recipient, TransferError},
@@ -30,10 +30,12 @@ impl UsbDevice {
     fn is_rndis_interface(class: u8, subclass: u8, protocol: u8) -> bool {
         matches!(
             (class, subclass, protocol),
-            (0xE0, 0x01, 0x03)
-                | (0x02, 0x02, 0x03)
-                | (0x02, 0xFF, 0x03)
-                | (0xFF, 0x01, 0x03)
+            (0xE0, 0x01, 0x03)   // RNDIS (Wireless Controller)
+            | (0x02, 0x02, 0x03)  // RNDIS (CDC)
+            | (0x02, 0xFF, 0x03)  // RNDIS (vendor-specific)
+            | (0xFF, 0x01, 0x03)  // RNDIS (vendor-specific)
+            | (0x02, 0x0D, 0x00)  // CDC NCM (Network Control Model)
+            | (0x02, 0x06, 0x00)  // CDC ECM (Ethernet Control Model)
         )
     }
 
@@ -55,18 +57,26 @@ impl UsbDevice {
 
             let config = match device.active_configuration() {
                 Ok(c) => c,
-                Err(_) => continue,
+                Err(e) => {
+                    debug!("device {vid:04x}:{pid:04x}: active_config failed: {e}");
+                    continue;
+                }
             };
 
             let mut comm_iface = None;
             let mut data_iface = None;
+            let mut iface_count = 0usize;
 
             for ifaces in config.interfaces() {
                 for alt in ifaces.alt_settings() {
+                    iface_count += 1;
                     let inum = alt.interface_number();
                     let class = alt.class();
                     let subclass = alt.subclass();
                     let protocol = alt.protocol();
+                    debug!(
+                        "device {vid:04x}:{pid:04x} iface {inum}: class={class:02x} sub={subclass:02x} proto={protocol:02x}"
+                    );
                     if Self::is_rndis_interface(class, subclass, protocol) {
                         comm_iface = Some(inum);
                         info!(
@@ -79,6 +89,7 @@ impl UsbDevice {
                 }
             }
 
+            debug!("device {vid:04x}:{pid:04x}: {iface_count} interfaces found");
             if comm_iface.is_none() {
                 continue;
             }
